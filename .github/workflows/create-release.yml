@@ -1,0 +1,78 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build a release, even if up to date"
+        required: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    if: "!contains(github.event.head_commit.message, '[ci skip]')"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch latest release version
+        id: remote-release
+        run: |
+          $release = irm -uri "https://api.github.com/repos/HachiFridge/Fridgerator/releases/latest" -method GET
+          echo "REMOTE_RELEASE=$($release.tag_name)" >> $ENV:GITHUB_OUTPUT
+          echo "DLL_URL=$($release.assets | where name -eq "fridgerator.dll" | select browser_download_url | %{$_.browser_download_url})" >> $ENV:GITHUB_OUTPUT
+
+      - name: Checkout latest extension release
+        id: checkout-new
+        # if: ${{ (steps.local-release.outputs.LOCAL_RELEASE != steps.remote-release.outputs.REMOTE_RELEASE) || inputs.force == true }}
+        env:
+          DLL_URL: ${{ steps.remote-release.outputs.DLL_URL }}
+        run: iwr -usebasicparsing -outfile fridgerator.dll -uri $ENV:DLL_URL
+
+      - name: Checkout Lead's FunnyHoney & Cellar
+        run: |
+          iwr -usebasicparsing -outfile FunnyHoney.exe -uri ${{ secrets.FUNNYHONEY_URL }}
+          iwr -usebasicparsing -outfile cellar.dll -uri "https://github.com/hachimi-hachimi/Cellar/releases/latest/download/cellar.dll"
+
+      - name: Build Installer
+        run: cargo build --target x86_64-pc-windows-msvc --release --features compress_bin --locked
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            target/x86_64-pc-windows-msvc/release/fridgerator_installer.exe
+
+  create-release:
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[ci skip]')"
+    steps:
+      - name: Get latest release info from Fridgerator
+        id: get_info
+        run: |
+          export release_info=$(curl -sL "https://api.github.com/repos/HachiFridge/Fridgerator/releases/latest")
+          echo "latest_tag=$(echo $release_info | jq -r .tag_name)" >> $GITHUB_OUTPUT
+          echo "release_url=$(echo $release_info | jq -r .html_url)" >> $GITHUB_OUTPUT
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Upload binaries to a release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ${{ steps.get_info.outputs.release_url }}
+          generate_release_notes: true
+          files: |
+            artifacts/**
+          tag_name: ${{ steps.get_info.outputs.latest_tag }}
