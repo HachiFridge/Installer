@@ -1,6 +1,10 @@
-use std::{ffi::CStr, path::{Path, PathBuf}};
-use crate::i18n::{t};
+use crate::i18n::t;
 use pelite::resources::version_info::VersionInfo;
+use std::{
+    ffi::CStr,
+    path::{Path, PathBuf},
+};
+#[cfg(windows)]
 use windows::{
     core::HSTRING,
     Win32::{
@@ -22,6 +26,19 @@ use windows::{
     },
 };
 
+#[cfg(not(windows))]
+pub use crate::installer::HWND;
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct RECT {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
 pub trait RECTExt {
     fn dimensions(&self) -> (i32, i32);
 }
@@ -32,20 +49,22 @@ impl RECTExt for RECT {
     }
 }
 
-pub fn center_window(window: HWND) -> Result<(), windows::core::Error> {
-    let screen = unsafe { GetDesktopWindow() };
-    let mut screen_rect = RECT::default();
-    unsafe { GetWindowRect(screen, &mut screen_rect)? };
-    let (screen_width, screen_height) = screen_rect.dimensions();
+pub fn center_window(#[allow(unused_variables)] window: HWND) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let screen = unsafe { GetDesktopWindow() };
+        let mut screen_rect = RECT::default();
+        unsafe { GetWindowRect(screen, &mut screen_rect).map_err(|e| e.to_string())? };
+        let (screen_width, screen_height) = screen_rect.dimensions();
 
-    let mut window_rect = RECT::default();
-    unsafe { GetWindowRect(window, &mut window_rect)? };
-    let (window_width, window_height) = window_rect.dimensions();
+        let mut window_rect = RECT::default();
+        unsafe { GetWindowRect(window, &mut window_rect).map_err(|e| e.to_string())? };
+        let (window_width, window_height) = window_rect.dimensions();
 
-    let x = screen_rect.left + (screen_width - window_width) / 2;
-    let y = screen_rect.top + (screen_height - window_height) / 2;
-    unsafe { SetWindowPos(window, None, x, y, 0, 0, SWP_NOSIZE)? };
-
+        let x = screen_rect.left + (screen_width - window_width) / 2;
+        let y = screen_rect.top + (screen_height - window_height) / 2;
+        unsafe { SetWindowPos(window, None, x, y, 0, 0, SWP_NOSIZE).map_err(|e| e.to_string())? };
+    }
     Ok(())
 }
 
@@ -59,49 +78,66 @@ pub fn read_pe_version_info<'a>(image: &'a [u8]) -> Option<VersionInfo<'a>> {
 }
 
 pub fn open_select_folder_dialog<P: AsRef<Path>>(
-    owner: HWND,
-    default_folder: Option<P>,
+    #[allow(unused_variables)] owner: HWND,
+    #[allow(unused_variables)] default_folder: Option<P>,
 ) -> Option<PathBuf> {
-    let dialog: IFileOpenDialog =
-        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()? };
+    #[cfg(windows)]
+    {
+        let dialog: IFileOpenDialog =
+            unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()? };
 
-    unsafe {
-        dialog.SetTitle(&HSTRING::from(t!("util.select_folder"))).ok()?;
-        dialog
-            .SetOptions(FOS_FILEMUSTEXIST | FOS_PICKFOLDERS)
-            .ok()?;
+        unsafe {
+            dialog
+                .SetTitle(&HSTRING::from(t!("util.select_folder")))
+                .ok()?;
+            dialog
+                .SetOptions(FOS_FILEMUSTEXIST | FOS_PICKFOLDERS)
+                .ok()?;
 
-        if let Some(path) = default_folder {
-            let default_folder_item: IShellItem =
-                SHCreateItemFromParsingName(&HSTRING::from(path.as_ref().to_str().unwrap()), None)
-                    .ok()?;
-            dialog.SetDefaultFolder(&default_folder_item).ok()?;
+            if let Some(path) = default_folder {
+                let default_folder_item: IShellItem = SHCreateItemFromParsingName(
+                    &HSTRING::from(path.as_ref().to_str().unwrap()),
+                    None,
+                )
+                .ok()?;
+                dialog.SetDefaultFolder(&default_folder_item).ok()?;
+            }
+
+            dialog.Show(owner).ok()?
         }
 
-        dialog.Show(owner).ok()?
+        let result = unsafe { dialog.GetResult().ok()? };
+        let path = unsafe { result.GetDisplayName(SIGDN_FILESYSPATH).ok()? };
+        let path_str = unsafe { path.to_string().unwrap() };
+        Some(path_str.into())
     }
-
-    let result = unsafe { dialog.GetResult().ok()? };
-    let path = unsafe { result.GetDisplayName(SIGDN_FILESYSPATH).ok()? };
-    let path_str = unsafe { path.to_string().unwrap() };
-    Some(path_str.into())
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 pub fn is_game_running() -> bool {
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPALL, 0) }) else {
-        return false;
-    };
-    let mut entry = PROCESSENTRY32::default();
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-    let mut res = unsafe { Process32First(snapshot, &mut entry) };
+    #[cfg(windows)]
+    {
+        let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPALL, 0) }) else {
+            return false;
+        };
+        let mut entry = PROCESSENTRY32::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+        let mut res = unsafe { Process32First(snapshot, &mut entry) };
 
-    while res.is_ok() {
-        let process_name = unsafe { CStr::from_ptr(entry.szExeFile.as_ptr()) };
-        if process_name == c"umamusume.exe" || process_name == c"UmamusumePrettyDerby_Jpn.exe" {
-            return true;
+        while res.is_ok() {
+            let process_name = unsafe { CStr::from_ptr(entry.szExeFile.as_ptr()) };
+            if process_name == c"umamusume.exe"
+                || process_name == c"UmamusumePrettyDerby_Jpn.exe"
+                || process_name == c"UmamusumePrettyDerby.exe"
+            {
+                return true;
+            }
+
+            res = unsafe { Process32Next(snapshot, &mut entry) };
         }
-
-        res = unsafe { Process32Next(snapshot, &mut entry) };
     }
 
     false

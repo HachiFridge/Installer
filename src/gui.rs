@@ -1,36 +1,98 @@
-use crate::{installer::{self, Installer}, resource::*, utils};
+use crate::i18n::{self, t, SUPPORTED_LOCALES};
+use crate::{
+    installer::{self, Installer},
+    resource::*,
+    utils,
+};
 #[cfg(feature = "net_install")]
 use std::thread;
 #[cfg(feature = "net_install")]
 use tinyjson::JsonValue;
-use crate::i18n::{self, SUPPORTED_LOCALES, t};
-use windows::{core::{HSTRING}, Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
-    System::LibraryLoader::GetModuleHandleW,
-    UI::{Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::{
-        CreateDialogParamW, DestroyIcon, DispatchMessageW, GetDlgItem, GetMessageW,
-        GetWindowLongPtrW, LoadIconW, MessageBoxW, PostQuitMessage, SendMessageW,
-        SetWindowLongPtrW,SetWindowTextW, ShowWindow, TranslateMessage,
-        CBN_SELCHANGE, CB_ADDSTRING, CB_DELETESTRING, CB_GETCURSEL, CB_INSERTSTRING, CB_SETCURSEL,
-        GWLP_USERDATA, ICON_BIG, IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING,
-        MB_OK, MB_OKCANCEL, MB_YESNO, MSG, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WM_SETICON
-    }},
-}};
+#[cfg(windows)]
+use windows::{
+    core::HSTRING,
+    Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{
+            Input::KeyboardAndMouse::EnableWindow,
+            WindowsAndMessaging::{
+                CreateDialogParamW, DestroyIcon, DispatchMessageW, GetDlgItem, GetMessageW,
+                GetWindowLongPtrW, LoadIconW, MessageBoxW, PostQuitMessage, SendMessageW,
+                SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, CBN_SELCHANGE,
+                CB_ADDSTRING, CB_DELETESTRING, CB_GETCURSEL, CB_INSERTSTRING, CB_SETCURSEL,
+                GWLP_USERDATA, ICON_BIG, IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
+                MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MSG, SW_SHOW, WM_CLOSE, WM_COMMAND,
+                WM_INITDIALOG, WM_SETICON,
+            },
+        },
+    },
+};
 
-unsafe fn localize_controls(dialog: HWND) {
+#[cfg(not(windows))]
+pub use crate::installer::HWND;
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(transparent)]
+pub struct WPARAM(pub usize);
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(transparent)]
+pub struct LPARAM(pub isize);
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct MSG {
+    pub hwnd: HWND,
+    pub message: u32,
+    pub wParam: WPARAM,
+    pub lParam: LPARAM,
+    pub time: u32,
+    pub pt: (i32, i32),
+}
+
+unsafe fn localize_controls(#[allow(unused_variables)] dialog: HWND) {
+    #[cfg(windows)]
+    {
         // Title
         _ = SetWindowTextW(dialog, &HSTRING::from(t!("gui.title")));
         // Button / Tag
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_INSTALL).unwrap(),   &HSTRING::from(t!("gui.install")));
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_UNINSTALL).unwrap(), &HSTRING::from(t!("gui.uninstall")));
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_INSTALL_PATH_BROWSE).unwrap(), &HSTRING::from(t!("gui.browse")));
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_LANGUAGE_LABEL).unwrap(), &HSTRING::from(t!("gui.msg_language")));
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_PACKAGED_VER).unwrap(), &HSTRING::from(t!("gui.packaged_ver", ver = env!("FRIDGERATOR_VERSION"))));
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_INSTALL_LOCATION).unwrap(), &HSTRING::from(t!("gui.install_location")));
-        _ = SetWindowTextW(GetDlgItem(dialog, IDC_TARGRT).unwrap(), &HSTRING::from(t!("gui.target")));
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_INSTALL).unwrap(),
+            &HSTRING::from(t!("gui.install")),
+        );
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_UNINSTALL).unwrap(),
+            &HSTRING::from(t!("gui.uninstall")),
+        );
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_INSTALL_PATH_BROWSE).unwrap(),
+            &HSTRING::from(t!("gui.browse")),
+        );
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_LANGUAGE_LABEL).unwrap(),
+            &HSTRING::from(t!("gui.msg_language")),
+        );
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_PACKAGED_VER).unwrap(),
+            &HSTRING::from(t!("gui.packaged_ver", ver = env!("FRIDGERATOR_VERSION"))),
+        );
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_INSTALL_LOCATION).unwrap(),
+            &HSTRING::from(t!("gui.install_location")),
+        );
+        _ = SetWindowTextW(
+            GetDlgItem(dialog, IDC_TARGRT).unwrap(),
+            &HSTRING::from(t!("gui.target")),
+        );
+    }
 }
 
-pub fn run() -> Result<(), windows::core::Error> {
+pub fn run() -> Result<(), String> {
+    #[allow(unused_mut)]
     let mut installer = Box::new(Installer::default());
 
     #[cfg(feature = "net_install")]
@@ -42,7 +104,10 @@ pub fn run() -> Result<(), windows::core::Error> {
             .unwrap();
 
         let get_version = || -> Result<String, Box<dyn std::error::Error>> {
-            let resp_text = client.get("https://api.github.com/repos/HachiFridge/Fridgerator/releases/latest").send()?.text()?;
+            let resp_text = client
+                .get("https://api.github.com/repos/HachiFridge/Fridgerator/releases/latest")
+                .send()?
+                .text()?;
             let json: JsonValue = resp_text.parse()?;
 
             // stole from lead
@@ -62,7 +127,15 @@ pub fn run() -> Result<(), windows::core::Error> {
                 *installer.fridgerator_version.lock().unwrap() = Some(version);
             }
             Err(_) => {
-                unsafe { MessageBoxW(None, w!("Unable to get Fridgerator version from GitHub. Are you online?"), w!("Error"), MB_ICONERROR | MB_OK) };
+                #[cfg(windows)]
+                unsafe {
+                    MessageBoxW(
+                        None,
+                        w!("Unable to get Fridgerator version from GitHub. Are you online?"),
+                        w!("Error"),
+                        MB_ICONERROR | MB_OK,
+                    )
+                };
                 return Ok(());
             }
         }
@@ -77,29 +150,46 @@ pub fn run() -> Result<(), windows::core::Error> {
             *dll_handle.lock().unwrap() = Some(result);
         });
     }
-    let instance = unsafe { GetModuleHandleW(None)? };
-    let dialog = unsafe {
-        CreateDialogParamW(instance, IDD_MAIN, None, Some(dlg_proc), LPARAM(installer.as_mut() as *mut _ as _))
-    }?;
-    utils::center_window(dialog)?;
-    unsafe { _ = ShowWindow(dialog, SW_SHOW) };
-    *installer.hwnd.lock().unwrap() = Some(dialog);
 
-    let mut message = MSG::default();
-    unsafe {
-        while GetMessageW(&mut message, None, 0, 0).into() {
-            _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+    #[cfg(windows)]
+    {
+        let instance = unsafe { GetModuleHandleW(None).map_err(|e| e.to_string())? };
+        let dialog = unsafe {
+            CreateDialogParamW(
+                instance,
+                IDD_MAIN,
+                None,
+                Some(dlg_proc),
+                LPARAM(installer.as_mut() as *mut _ as _),
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        utils::center_window(dialog).map_err(|e| e.to_string())?;
+        unsafe { _ = ShowWindow(dialog, SW_SHOW) };
+        *installer.hwnd.lock().unwrap() = Some(dialog);
+
+        let mut message = MSG::default();
+        unsafe {
+            while GetMessageW(&mut message, None, 0, 0).into() {
+                _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
     }
 
     Ok(())
 }
 
+#[cfg(windows)]
 fn get_installer(dialog: HWND) -> &'static mut Installer {
-    unsafe { (GetWindowLongPtrW(dialog, GWLP_USERDATA) as *mut Installer).as_mut().unwrap() }
+    unsafe {
+        (GetWindowLongPtrW(dialog, GWLP_USERDATA) as *mut Installer)
+            .as_mut()
+            .unwrap()
+    }
 }
 
+#[cfg(windows)]
 fn update_target(dialog: HWND, target_combo: HWND, index: usize) {
     let installer = get_installer(dialog);
     let target = installer::Target::VALUES[index];
@@ -109,38 +199,54 @@ fn update_target(dialog: HWND, target_combo: HWND, index: usize) {
     }
     let install_path_edit = unsafe { GetDlgItem(dialog, IDC_INSTALL_PATH).unwrap() };
     if let Some(path) = &installer.install_dir {
-        unsafe { let _ = SetWindowTextW(install_path_edit, &HSTRING::from(path.to_str().unwrap())); };
+        unsafe {
+            let _ = SetWindowTextW(install_path_edit, &HSTRING::from(path.to_str().unwrap()));
+        };
     } else {
-        unsafe { let _ = SetWindowTextW(install_path_edit, &HSTRING::from("")); };
+        unsafe {
+            let _ = SetWindowTextW(install_path_edit, &HSTRING::from(""));
+        };
     }
 
     let mut installed = false;
     let label = if let Some(version_info) = installer.get_target_version_info(target) {
         installed = true;
         version_info.version.unwrap_or_else(|| "Unknown".to_owned())
-    }
-    else {
+    } else {
         "None".to_owned()
     };
 
     let installed_static = unsafe { GetDlgItem(dialog, IDC_INSTALLED).unwrap() };
     unsafe {
-        _ = SetWindowTextW(installed_static, &HSTRING::from(t!("gui.installed", ver = label)));
+        _ = SetWindowTextW(
+            installed_static,
+            &HSTRING::from(t!("gui.installed", ver = label)),
+        );
         _ = EnableWindow(GetDlgItem(dialog, IDC_UNINSTALL).unwrap(), installed);
     }
-        
 
     let label = installer.get_target_display_label(target);
     unsafe {
         SendMessageW(target_combo, CB_DELETESTRING, WPARAM(index), None);
-        SendMessageW(target_combo, CB_INSERTSTRING, WPARAM(index), LPARAM(HSTRING::from(label).as_ptr() as _));
+        SendMessageW(
+            target_combo,
+            CB_INSERTSTRING,
+            WPARAM(index),
+            LPARAM(HSTRING::from(label).as_ptr() as _),
+        );
         SendMessageW(target_combo, CB_SETCURSEL, WPARAM(index), None);
     }
 
     installer.target = target;
 }
 
-unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+#[cfg(windows)]
+unsafe extern "system" fn dlg_proc(
+    dialog: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
     match message {
         WM_INITDIALOG => {
             // Set the installer ptr
@@ -150,7 +256,12 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
             // Set icon
             let instance = unsafe { GetModuleHandleW(None).unwrap() };
             if let Ok(icon) = LoadIconW(instance, IDI_FRIDGERATOR) {
-                SendMessageW(dialog, WM_SETICON, WPARAM(ICON_BIG as _), LPARAM(icon.0 as _));
+                SendMessageW(
+                    dialog,
+                    WM_SETICON,
+                    WPARAM(ICON_BIG as _),
+                    LPARAM(icon.0 as _),
+                );
                 _ = DestroyIcon(icon);
             }
 
@@ -166,17 +277,23 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                 let packaged_ver_static = GetDlgItem(dialog, IDC_PACKAGED_VER).unwrap();
                 _ = SetWindowTextW(
                     packaged_ver_static,
-                    &HSTRING::from(t!("gui.packaged_ver", ver = env!("FRIDGERATOR_VERSION")))
+                    &HSTRING::from(t!("gui.packaged_ver", ver = env!("FRIDGERATOR_VERSION"))),
                 );
             }
             #[cfg(feature = "net_install")]
             {
-                let version_str = installer.fridgerator_version.lock().unwrap()
+                let version_str = installer
+                    .fridgerator_version
+                    .lock()
+                    .unwrap()
                     .as_deref()
                     .unwrap_or("Error")
                     .to_string();
                 let packaged_ver_static = GetDlgItem(dialog, IDC_PACKAGED_VER).unwrap();
-                _ = SetWindowTextW(packaged_ver_static, &HSTRING::from(t!("gui.packaged_ver", version_str)));
+                _ = SetWindowTextW(
+                    packaged_ver_static,
+                    &HSTRING::from(t!("gui.packaged_ver", version_str)),
+                );
             }
 
             localize_controls(dialog);
@@ -185,8 +302,11 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
             let lang_combo = GetDlgItem(dialog, IDC_LANGUAGE_COMBO).unwrap();
             for (idx, (_, _, gui_label)) in SUPPORTED_LOCALES.iter().enumerate() {
                 SendMessageW(
-                    lang_combo, CB_ADDSTRING, None,
-                    LPARAM(HSTRING::from(*gui_label).as_ptr() as _));
+                    lang_combo,
+                    CB_ADDSTRING,
+                    None,
+                    LPARAM(HSTRING::from(*gui_label).as_ptr() as _),
+                );
                 if SUPPORTED_LOCALES[idx].0 == *i18n::CURRENT_LOCALE.lock().unwrap() {
                     SendMessageW(lang_combo, CB_SETCURSEL, WPARAM(idx), None);
                 }
@@ -208,12 +328,18 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
             for target in installer::Target::VALUES {
                 let label = installer.get_target_display_label(*target);
                 SendMessageW(
-                    target_combo, CB_ADDSTRING, None, LPARAM(HSTRING::from(label).as_ptr() as _)
+                    target_combo,
+                    CB_ADDSTRING,
+                    None,
+                    LPARAM(HSTRING::from(label).as_ptr() as _),
                 );
             }
 
             let default_target_enum = installer::Target::default();
-            let default_target_idx = installer::Target::VALUES.iter().position(|&t| t == default_target_enum).unwrap_or(0);
+            let default_target_idx = installer::Target::VALUES
+                .iter()
+                .position(|&t| t == default_target_enum)
+                .unwrap_or(0);
 
             update_target(dialog, target_combo, default_target_idx);
 
@@ -227,7 +353,7 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                     dialog,
                     &HSTRING::from(t!("gui.warning_no_dir")),
                     &HSTRING::from(t!("gui.warning")),
-                    MB_ICONWARNING | MB_OK
+                    MB_ICONWARNING | MB_OK,
                 );
             }
 
@@ -242,7 +368,7 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
             // }
 
             1
-        },
+        }
 
         WM_COMMAND => {
             let control_id = wparam.0 as i16 as i32;
@@ -253,17 +379,20 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
             match control_id {
                 IDC_LANGUAGE_COMBO if ncode == CBN_SELCHANGE => {
                     let combo = GetDlgItem(dialog, IDC_LANGUAGE_COMBO).unwrap();
-                    let idx   = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
+                    let idx = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
                     i18n::set_locale(SUPPORTED_LOCALES[idx].0);
                     localize_controls(dialog);
-                    update_target(dialog, GetDlgItem(dialog, IDC_TARGET).unwrap(),
-                                  get_installer(dialog).target as _);
+                    update_target(
+                        dialog,
+                        GetDlgItem(dialog, IDC_TARGET).unwrap(),
+                        get_installer(dialog).target as _,
+                    );
                 }
                 IDC_INSTALL_PATH_BROWSE => {
                     let installer = get_installer(dialog);
                     let Some(path) = utils::open_select_folder_dialog(
                         dialog,
-                        installer.install_dir.as_ref().filter(|p| p.is_dir())
+                        installer.install_dir.as_ref().filter(|p| p.is_dir()),
                     ) else {
                         return 1;
                     };
@@ -276,7 +405,11 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                     }
 
                     installer.install_dir = Some(path);
-                    update_target(dialog, GetDlgItem(dialog, IDC_TARGET).unwrap(), installer.target as _);
+                    update_target(
+                        dialog,
+                        GetDlgItem(dialog, IDC_TARGET).unwrap(),
+                        installer.target as _,
+                    );
                 }
 
                 IDC_TARGET => {
@@ -294,10 +427,12 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                         if target != installer.target {
                             MessageBoxW(
                                 dialog,
-                                &HSTRING::from(t!("gui.already_installed", dll = target.dll_name())),
+                                &HSTRING::from(t!(
+                                    "gui.already_installed",
+                                    dll = target.dll_name()
+                                )),
                                 &HSTRING::from(t!("gui.error")),
-
-                                MB_ICONERROR | MB_OK
+                                MB_ICONERROR | MB_OK,
                             );
                             return 0;
                         }
@@ -305,9 +440,12 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                     if installer.is_current_target_installed() {
                         let res = MessageBoxW(
                             dialog,
-                            &HSTRING::from(t!("gui.replace_confirm", dll = installer.target.dll_name())),
+                            &HSTRING::from(t!(
+                                "gui.replace_confirm",
+                                dll = installer.target.dll_name()
+                            )),
                             &HSTRING::from(t!("gui.install")),
-                            MB_ICONINFORMATION | MB_OKCANCEL
+                            MB_ICONINFORMATION | MB_OKCANCEL,
                         );
                         if res != IDOK {
                             return 0;
@@ -319,22 +457,32 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                             dialog,
                             &HSTRING::from(t!("gui.warning_no_backup")),
                             &HSTRING::from(t!("gui.warning")),
-                            MB_ICONWARNING | MB_OK
+                            MB_ICONWARNING | MB_OK,
                         );
                     }
-                    match installer.install()
-                        .and_then(|_| installer.post_install())
-                    {
+                    match installer.install().and_then(|_| installer.post_install()) {
                         Ok(_) => {
-                            MessageBoxW(dialog, &HSTRING::from(t!("gui.msg_install_ok")),  
-                                              &HSTRING::from(t!("gui.title")), MB_ICONINFORMATION | MB_OK);
-                        },
+                            MessageBoxW(
+                                dialog,
+                                &HSTRING::from(t!("gui.msg_install_ok")),
+                                &HSTRING::from(t!("gui.title")),
+                                MB_ICONINFORMATION | MB_OK,
+                            );
+                        }
                         Err(e) => {
-                            MessageBoxW(dialog, &HSTRING::from(t!("gui.msg_install_fail", err = e.to_string())),
-                                              &HSTRING::from(t!("gui.title")), MB_ICONERROR | MB_OK);
+                            MessageBoxW(
+                                dialog,
+                                &HSTRING::from(t!("gui.msg_install_fail", err = e.to_string())),
+                                &HSTRING::from(t!("gui.title")),
+                                MB_ICONERROR | MB_OK,
+                            );
                         }
                     }
-                    update_target(dialog, GetDlgItem(dialog, IDC_TARGET).unwrap(), installer.target as _);
+                    update_target(
+                        dialog,
+                        GetDlgItem(dialog, IDC_TARGET).unwrap(),
+                        installer.target as _,
+                    );
                 }
 
                 IDC_UNINSTALL => {
@@ -343,7 +491,7 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                         dialog,
                         &HSTRING::from(t!("gui.delete_confirm", dll = installer.target.dll_name())),
                         &HSTRING::from(t!("gui.uninstall")),
-                        MB_ICONINFORMATION | MB_OKCANCEL
+                        MB_ICONINFORMATION | MB_OKCANCEL,
                     );
                     if res == IDOK {
                         let version_info_opt = installer.get_target_version_info(installer.target);
@@ -351,13 +499,27 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                             // fall through but clarify danger
                             // only interrupt if error is not FailedToRestore
                             if matches!(e, installer::Error::FailedToRestore) {
-                                MessageBoxW(dialog, &HSTRING::from(e.to_string()), &HSTRING::from(t!("gui.warning")), MB_ICONWARNING | MB_OK);
+                                MessageBoxW(
+                                    dialog,
+                                    &HSTRING::from(e.to_string()),
+                                    &HSTRING::from(t!("gui.warning")),
+                                    MB_ICONWARNING | MB_OK,
+                                );
                             } else {
-                                MessageBoxW(dialog, &HSTRING::from(e.to_string()), &HSTRING::from(t!("gui.error")), MB_ICONERROR | MB_OK);
+                                MessageBoxW(
+                                    dialog,
+                                    &HSTRING::from(e.to_string()),
+                                    &HSTRING::from(t!("gui.error")),
+                                    MB_ICONERROR | MB_OK,
+                                );
                                 return 0;
                             };
                         }
-                        update_target(dialog, GetDlgItem(dialog, IDC_TARGET).unwrap(), installer.target as _);
+                        update_target(
+                            dialog,
+                            GetDlgItem(dialog, IDC_TARGET).unwrap(),
+                            installer.target as _,
+                        );
 
                         if let Some(version_info) = version_info_opt {
                             if !version_info.is_fridgerator() {
@@ -365,7 +527,8 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                             }
 
                             // Check if the fridgerator data dir exists and prompt user to delete it
-                            let fridgerator_dir = installer.install_dir.as_ref().unwrap().join("fridgerator");
+                            let fridgerator_dir =
+                                installer.install_dir.as_ref().unwrap().join("fridgerator");
                             let Ok(metadata) = std::fs::metadata(&fridgerator_dir) else {
                                 return 0;
                             };
@@ -375,13 +538,17 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                                     dialog,
                                     &HSTRING::from(t!("gui.delete_data_dir")),
                                     &HSTRING::from(t!("gui.uninstall")),
-
-                                    MB_ICONINFORMATION | MB_YESNO
+                                    MB_ICONINFORMATION | MB_YESNO,
                                 );
 
                                 if res == IDYES {
                                     if let Err(e) = std::fs::remove_dir_all(&fridgerator_dir) {
-                                        MessageBoxW(dialog, &HSTRING::from(e.to_string()), &HSTRING::from(t!("gui.error")), MB_ICONERROR | MB_OK);
+                                        MessageBoxW(
+                                            dialog,
+                                            &HSTRING::from(e.to_string()),
+                                            &HSTRING::from(t!("gui.error")),
+                                            MB_ICONERROR | MB_OK,
+                                        );
                                         return 0;
                                     }
                                 }
@@ -389,18 +556,28 @@ unsafe extern "system" fn dlg_proc(dialog: HWND, message: u32, wparam: WPARAM, l
                         }
                     }
                 }
-                
-                _ => return 0
+
+                _ => return 0,
             }
 
             1
         }
-        
+
         WM_CLOSE => {
             PostQuitMessage(0);
             0
         }
 
-        _ => 0
+        _ => 0,
     }
+}
+
+#[cfg(not(windows))]
+unsafe extern "system" fn dlg_proc(
+    _dialog: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+) -> isize {
+    0
 }

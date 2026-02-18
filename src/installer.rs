@@ -1,21 +1,132 @@
-use std::{fs::File, io::Write, path::{Path, PathBuf}};
-use std::sync::{Arc, Mutex};
-use pelite::resources::version_info::Language;
-use registry::Hive;
-use tinyjson::JsonValue;
 use crate::i18n::t;
-use windows::{core::HSTRING, Win32::{Foundation::HWND, UI::{Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT}, WindowsAndMessaging::{MessageBoxW, IDOK, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL}}}};
+use crate::utils::{self};
+use bsdiff;
 #[cfg(feature = "net_install")]
 use bytes::Bytes;
+use pelite::resources::version_info::Language;
+#[cfg(windows)]
+use std::env;
+use std::sync::{Arc, Mutex};
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use steamlocate::SteamDir;
-use bsdiff;
-use crate::utils::{self};
+#[cfg(windows)]
+use tinyjson::JsonValue;
+#[cfg(windows)]
+use windows::{
+    core::HSTRING,
+    Win32::{
+        Foundation::HWND,
+        UI::{
+            Shell::{
+                FOLDERID_RoamingAppData, SHGetKnownFolderPath, ShellExecuteW, KF_FLAG_DEFAULT,
+            },
+            WindowsAndMessaging::{
+                MessageBoxW, IDOK, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_OKCANCEL,
+                SW_SHOWNORMAL,
+            },
+        },
+    },
+};
+#[cfg(windows)]
+use windows_registry::LOCAL_MACHINE;
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct HWND(pub isize);
 
 #[cfg(feature = "net_install")]
 type DownloadResult = Result<Bytes, reqwest::Error>;
 
 pub const GLOBAL_STEAM_ID: u32 = 3224770;
 pub const JP_STEAM_ID: u32 = 3564400;
+
+const DEVOVERRIDE_KEY: &str =
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+
+// separate out read check cus it doesnt require admin privileges
+#[cfg(windows)]
+pub fn is_dotlocal_enabled() -> bool {
+    match LOCAL_MACHINE.open(DEVOVERRIDE_KEY) {
+        Ok(regkey) => regkey
+            .get_u32("DevOverrideEnable")
+            .map(|v| v != 0)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_dotlocal_enabled() -> bool {
+    false
+}
+
+// enable dotlocal in registry, run as admin required
+#[cfg(windows)]
+pub fn enable_dotlocal() {
+    match LOCAL_MACHINE.create(DEVOVERRIDE_KEY) {
+        Ok(regkey) => match regkey.set_u32("DevOverrideEnable", 1) {
+            Ok(_) => unsafe {
+                MessageBoxW(
+                    None,
+                    &HSTRING::from(t!("installer.restart_to_apply")),
+                    &HSTRING::from(t!("installer.dll_redirection_enabled")),
+                    MB_ICONINFORMATION | MB_OK,
+                );
+            },
+            Err(e) => unsafe {
+                MessageBoxW(
+                    None,
+                    &HSTRING::from(t!("installer.failed_enable_dotlocal", error = e)),
+                    &HSTRING::from(t!("installer.warning")),
+                    MB_ICONERROR | MB_OK,
+                );
+            },
+        },
+        Err(e) => unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(t!("installer.failed_open_ifeo", error = e)),
+                &HSTRING::from(t!("installer.warning")),
+                MB_ICONERROR | MB_OK,
+            );
+        },
+    }
+}
+
+#[cfg(not(windows))]
+pub fn enable_dotlocal() {}
+
+fn request_dotlocal_elevation(#[allow(unused_variables)] hwnd: Option<&HWND>) -> bool {
+    #[cfg(windows)]
+    {
+        let exe_path = env::current_exe().ok();
+        let Some(exe_path) = exe_path else {
+            return false;
+        };
+
+        let result = unsafe {
+            ShellExecuteW(
+                hwnd.map(|h| *h).unwrap_or_default(),
+                &HSTRING::from("runas"),
+                &HSTRING::from(exe_path.to_string_lossy().as_ref()),
+                &HSTRING::from("--enable-dotlocal"),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+
+        // ShellExecuteW returns a value > 32 on success
+        return result.0 as usize > 32;
+    }
+
+    #[cfg(not(windows))]
+    false
+}
 
 pub struct Installer {
     pub install_dir: Option<PathBuf>,
@@ -25,61 +136,61 @@ pub struct Installer {
     #[cfg(feature = "net_install")]
     pub fridgerator_dll: Arc<Mutex<Option<DownloadResult>>>,
     #[cfg(feature = "net_install")]
-    pub fridgerator_version: Arc<Mutex<Option<String>>>
+    pub fridgerator_version: Arc<Mutex<Option<String>>>,
 }
 
 pub fn detect_dmm_install_dir() -> Option<PathBuf> {
-    let app_data_dir_wstr = unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()? };
-    let app_data_dir_str = unsafe { app_data_dir_wstr.to_string().ok()? };
-    let app_data_dir = Path::new(&app_data_dir_str);
-    let mut dmm_config_path = app_data_dir.join("dmmgameplayer5");
-    dmm_config_path.push("dmmgame.cnf");
+    #[cfg(windows)]
+    {
+        let app_data_dir_wstr =
+            unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()? };
+        let app_data_dir_str = unsafe { app_data_dir_wstr.to_string().ok()? };
+        let app_data_dir = Path::new(&app_data_dir_str);
+        let mut dmm_config_path = app_data_dir.join("dmmgameplayer5");
+        dmm_config_path.push("dmmgame.cnf");
 
-    let config_str = std::fs::read_to_string(dmm_config_path).ok()?;
-    let JsonValue::Object(config) = config_str.parse().ok()? else {
-        return None;
-    };
-    let JsonValue::Array(config_contents) = &config["contents"] else {
-        return None;
-    };
-    for value in config_contents {
-        let JsonValue::Object(game) = value else {
+        let config_str = std::fs::read_to_string(dmm_config_path).ok()?;
+        let JsonValue::Object(config) = config_str.parse().ok()? else {
             return None;
         };
-
-        let JsonValue::String(product_id) = &game["productId"] else {
-            continue;
-        };
-        if product_id != "umamusume" {
-            continue;
-        }
-
-        let JsonValue::Object(detail) = &game["detail"] else {
+        let JsonValue::Array(config_contents) = &config["contents"] else {
             return None;
         };
-        let JsonValue::String(path_str) = &detail["path"] else {
-            return None;
-        };
+        for value in config_contents {
+            let JsonValue::Object(game) = value else {
+                return None;
+            };
 
-        let path = PathBuf::from(path_str);
-        return if path.is_dir() {
-            Some(path)
-        }
-        else {
-            None
+            let JsonValue::String(product_id) = &game["productId"] else {
+                continue;
+            };
+            if product_id != "umamusume" {
+                continue;
+            }
+
+            let JsonValue::Object(detail) = &game["detail"] else {
+                return None;
+            };
+            let JsonValue::String(path_str) = &detail["path"] else {
+                return None;
+            };
+
+            let path = PathBuf::from(path_str);
+            if path.is_dir() {
+                return Some(path);
+            }
         }
     }
-
     None
 }
 
 pub fn detect_steam_install_dir(app_id: u32) -> Option<PathBuf> {
     let steam_dir = SteamDir::locate().ok()?;
-    let (uma_musume_steamapp, _lib) = steam_dir
-        .find_app(app_id)
-        .ok()??;
+    let (uma_musume_steamapp, _lib) = steam_dir.find_app(app_id).ok()??;
     let game_path = _lib.resolve_app_dir(&uma_musume_steamapp);
-    if game_path.is_dir() { return Some(game_path) };
+    if game_path.is_dir() {
+        return Some(game_path);
+    };
     None
 }
 
@@ -100,7 +211,11 @@ pub fn detect_target_from_path(path: &Path) -> Option<Target> {
 }
 
 impl Installer {
-    pub fn custom(install_dir: Option<PathBuf>, target: Target, custom_target: Option<String>) -> Installer {
+    pub fn custom(
+        install_dir: Option<PathBuf>,
+        target: Target,
+        custom_target: Option<String>,
+    ) -> Installer {
         Installer {
             install_dir: install_dir.or_else(|| Self::detect_install_dir(target)),
             target,
@@ -109,7 +224,7 @@ impl Installer {
             #[cfg(feature = "net_install")]
             fridgerator_dll: Arc::new(Mutex::new(None)),
             #[cfg(feature = "net_install")]
-            fridgerator_version: Arc::new(Mutex::new(None))
+            fridgerator_version: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -125,8 +240,12 @@ impl Installer {
     fn get_target_path_internal(&self, target: Target, p: impl AsRef<Path>) -> Option<PathBuf> {
         Some(match TargetType::from(target) {
             // DMM has a different executable name, but also doesn't need the exe binary patch
-            TargetType::DotLocal => self.install_dir.as_ref()?.join("umamusume.exe.local").join(p),
-            TargetType::Direct => self.install_dir.as_ref()?.join(p)
+            TargetType::DotLocal => self
+                .install_dir
+                .as_ref()?
+                .join("umamusume.exe.local")
+                .join(p),
+            TargetType::Direct => self.install_dir.as_ref()?.join(p),
         })
     }
 
@@ -135,15 +254,20 @@ impl Installer {
     }
 
     pub fn get_current_target_path(&self) -> Option<PathBuf> {
-        self.get_target_path_internal(self.target, if let Some(custom_target) = &self.custom_target {
-            custom_target
-        }
-        else {
-            self.target.dll_name()
-        })
+        self.get_target_path_internal(
+            self.target,
+            if let Some(custom_target) = &self.custom_target {
+                custom_target
+            } else {
+                self.target.dll_name()
+            },
+        )
     }
 
-    const LANG_NEUTRAL_UNICODE: Language = Language { lang_id: 0x0000, charset_id: 0x04b0 };
+    const LANG_NEUTRAL_UNICODE: Language = Language {
+        lang_id: 0x0000,
+        charset_id: 0x04b0,
+    };
     pub fn get_target_version_info(&self, target: Target) -> Option<TargetVersionInfo> {
         let path = self.get_target_path(target)?;
         let map = pelite::FileMap::open(&path).ok()?;
@@ -155,7 +279,7 @@ impl Installer {
 
         Some(TargetVersionInfo {
             name: version_info.value(Self::LANG_NEUTRAL_UNICODE, "ProductName"),
-            version: version_info.value(Self::LANG_NEUTRAL_UNICODE, "ProductVersion")
+            version: version_info.value(Self::LANG_NEUTRAL_UNICODE, "ProductVersion"),
         })
     }
 
@@ -173,8 +297,7 @@ impl Installer {
             } else {
                 format!("{} ({})", platform, target.dll_name())
             }
-        }
-        else {
+        } else {
             format!("{} ({})", platform, target.dll_name())
         }
     }
@@ -251,7 +374,14 @@ impl Installer {
         }
         #[cfg(not(any(feature = "net_install", feature = "compress_bin")))]
         {
-            mod_dll = include_bytes!("../fridgerator.dll").to_vec();
+            #[cfg(windows)]
+            {
+                mod_dll = include_bytes!("../fridgerator.dll").to_vec();
+            }
+            #[cfg(not(windows))]
+            {
+                mod_dll = vec![];
+            }
         }
 
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -267,7 +397,9 @@ impl Installer {
         match self.target {
             Target::UnityPlayer => {
                 // Install Cellar
-                let path = self.install_dir.as_ref()
+                let path = self
+                    .install_dir
+                    .as_ref()
                     .ok_or_else(|| Error::NoInstallDir)?
                     .join("umamusume.exe.local")
                     .join("apphelp.dll");
@@ -278,57 +410,41 @@ impl Installer {
                 file.write(&include_bytes_zstd!("cellar.dll", 19))?;
 
                 #[cfg(not(feature = "compress_bin"))]
+                #[cfg(windows)]
                 file.write(include_bytes!("../cellar.dll"))?;
 
                 // Check for DLL redirection
-                match Hive::LocalMachine.open(
-                    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
-                    registry::Security::Read | registry::Security::SetValue
-                ) {
-                    Ok(regkey) => {
-                        if regkey.value("DevOverrideEnable")
-                            .ok()
-                            .map(|v| match v {
-                                registry::Data::U32(v) => v,
-                                _ => 0
-                            })
-                            .unwrap_or(0) == 0
-                        {
-                            let res = unsafe {
-                                MessageBoxW(
-                                    self.hwnd.lock().unwrap().as_ref(),
-                                    &HSTRING::from(t!("installer.dotlocal_not_enabled")),
-                                    &HSTRING::from(t!("installer.install")),
-                                    MB_ICONINFORMATION | MB_OKCANCEL
-                                )
-                            };
-                            if res == IDOK {
-                                regkey.set_value("DevOverrideEnable", &registry::Data::U32(1))?;
-                                unsafe {
-                                    MessageBoxW(
-                                        self.hwnd.lock().unwrap().as_ref(),
-                                        &HSTRING::from(t!("installer.restart_to_apply")),
-                                        &HSTRING::from(t!("installer.dll_redirection_enabled")),
-                                        MB_ICONINFORMATION | MB_OK
-                                    );
-                                }
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        unsafe { MessageBoxW(
+                #[cfg(windows)]
+                if !is_dotlocal_enabled() {
+                    let res = unsafe {
+                        MessageBoxW(
                             self.hwnd.lock().unwrap().as_ref(),
-                            &HSTRING::from(t!("installer.failed_open_ifeo", error = e)),
-                            &HSTRING::from(t!("installer.warning")),
-                            MB_OK | MB_ICONWARNING
-                        )};
+                            &HSTRING::from(t!("installer.dotlocal_not_enabled")),
+                            &HSTRING::from(t!("installer.install")),
+                            MB_ICONINFORMATION | MB_OKCANCEL,
+                        )
+                    };
+                    if res == IDOK {
+                        // Request elevation to enable DotLocal
+                        request_dotlocal_elevation(self.hwnd.lock().unwrap().as_ref());
                     }
                 }
-            },
+            }
             Target::CriManaVpx => {
                 // compatibility: delete dotlocal DLL redir if exists
-                if self.install_dir.as_ref().unwrap().join("UmamusumePrettyDerby_Jpn.exe.local").exists() {
-                    std::fs::remove_dir_all(self.install_dir.as_ref().unwrap().join("UmamusumePrettyDerby_Jpn.exe.local"))?;
+                if self
+                    .install_dir
+                    .as_ref()
+                    .unwrap()
+                    .join("UmamusumePrettyDerby_Jpn.exe.local")
+                    .exists()
+                {
+                    std::fs::remove_dir_all(
+                        self.install_dir
+                            .as_ref()
+                            .unwrap()
+                            .join("UmamusumePrettyDerby_Jpn.exe.local"),
+                    )?;
                 }
 
                 let exe_path = self.get_orig_exe_path().ok_or(Error::NoInstallDir)?;
@@ -338,12 +454,17 @@ impl Installer {
                 #[cfg(feature = "compress_bin")]
                 let modded_bytes: &[u8] = &include_bytes_zstd!("FunnyHoney.exe", 19);
                 #[cfg(not(feature = "compress_bin"))]
+                #[cfg(windows)]
                 let modded_bytes: &[u8] = include_bytes!("../FunnyHoney.exe");
-                let mut patch = Vec::new(); {
+                #[cfg(not(windows))]
+                let modded_bytes: &[u8] = &[];
+                let mut patch = Vec::new();
+                {
                     bsdiff::diff(&exe_bytes, &modded_bytes, &mut patch)?;
                 }
 
-                let mut patched_bytes = Vec::with_capacity(modded_bytes.len()); {
+                let mut patched_bytes = Vec::with_capacity(modded_bytes.len());
+                {
                     bsdiff::patch(&exe_bytes, &mut patch.as_slice(), &mut patched_bytes)?;
                 }
                 debug_assert_eq!(modded_bytes, patched_bytes);
@@ -374,7 +495,7 @@ impl Installer {
 
                 // Only remove if its empty
                 _ = std::fs::remove_dir(parent);
-            },
+            }
             Target::CriManaVpx => {
                 let backup_exe = self.get_backup_exe_path().ok_or(Error::NoInstallDir)?;
                 let orig_exe = self.get_orig_exe_path().ok_or(Error::NoInstallDir)?;
@@ -391,17 +512,26 @@ impl Installer {
     }
 
     pub fn get_backup_exe_path(&self) -> Option<PathBuf> {
-        Some(self.install_dir.as_ref()?.join("UmamusumePrettyDerby_Jpn.old.exe"))
+        Some(
+            self.install_dir
+                .as_ref()?
+                .join("UmamusumePrettyDerby_Jpn.old.exe"),
+        )
     }
 
     pub fn get_orig_exe_path(&self) -> Option<PathBuf> {
-        Some(self.install_dir.as_ref()?.join("UmamusumePrettyDerby_Jpn.exe"))
+        Some(
+            self.install_dir
+                .as_ref()?
+                .join("UmamusumePrettyDerby_Jpn.exe"),
+        )
     }
 }
 
 impl Default for Installer {
     fn default() -> Installer {
-        let install_dir = Target::VALUES.iter()
+        let install_dir = Target::VALUES
+            .iter()
             .find_map(|t| Self::detect_install_dir(*t));
 
         Installer {
@@ -412,7 +542,7 @@ impl Default for Installer {
             #[cfg(feature = "net_install")]
             fridgerator_dll: Arc::new(Mutex::new(None)),
             #[cfg(feature = "net_install")]
-            fridgerator_version: Arc::new(Mutex::new(None))
+            fridgerator_version: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -421,21 +551,17 @@ impl Default for Installer {
 pub enum Target {
     UnityPlayer,
     CriManaVpx,
-    CriManaVpxGlobal
+    CriManaVpxGlobal,
 }
 
 impl Target {
-    pub const VALUES: &[Self] = &[
-        Self::UnityPlayer,
-        Self::CriManaVpx,
-        Self::CriManaVpxGlobal
-    ];
+    pub const VALUES: &[Self] = &[Self::UnityPlayer, Self::CriManaVpx, Self::CriManaVpxGlobal];
 
     pub fn dll_name(&self) -> &'static str {
         match self {
             Self::UnityPlayer => "UnityPlayer.dll",
             Self::CriManaVpx => "cri_mana_vpx.dll",
-            Self::CriManaVpxGlobal => "cri_mana_vpx.dll"
+            Self::CriManaVpxGlobal => "cri_mana_vpx.dll",
         }
     }
 }
@@ -459,7 +585,7 @@ impl Default for Target {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TargetType {
     DotLocal,
-    Direct
+    Direct,
 }
 
 impl From<Target> for TargetType {
@@ -475,7 +601,7 @@ impl From<Target> for TargetType {
 #[derive(Debug, Default)]
 pub struct TargetVersionInfo {
     pub name: Option<String>,
-    pub version: Option<String>
+    pub version: Option<String>,
 }
 
 impl TargetVersionInfo {
@@ -491,7 +617,10 @@ impl TargetVersionInfo {
 pub enum Error {
     NoInstallDir,
     IoError(std::io::Error),
-    RegistryValueError(registry::value::Error),
+    #[cfg(windows)]
+    RegistryError(windows_result::Error),
+    #[cfg(not(windows))]
+    RegistryError(String),
     FailedToRestore,
     #[cfg(feature = "net_install")]
     ReqwestError(reqwest::Error),
@@ -506,12 +635,15 @@ impl std::fmt::Display for Error {
         match self {
             Error::NoInstallDir => write!(f, "{}", t!("error.no_install_dir")),
             Error::IoError(e) => write!(f, "{}", t!("error.io_error", error = e)),
-            Error::RegistryValueError(e) => write!(f, "{}", t!("error.registry_value_error", error = e)),
+            Error::RegistryError(e) => write!(f, "{}", t!("error.registry_value_error", error = e)),
             Error::FailedToRestore => write!(f, "{}", t!("error.failed_to_restore")),
             #[cfg(feature = "net_install")]
             Error::ReqwestError(e) => write!(f, "Download error: {}", e),
             #[cfg(feature = "net_install")]
-            Error::DownloadFailed => write!(f, "Download failed on a previous attempt. Please restart the installer."),
+            Error::DownloadFailed => write!(
+                f,
+                "Download failed on a previous attempt. Please restart the installer."
+            ),
             #[cfg(feature = "net_install")]
             Error::DownloadNotStarted => write!(f, "Download has not started."),
         }
@@ -524,9 +656,10 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<registry::value::Error> for Error {
-    fn from(e: registry::value::Error) -> Self {
-        Error::RegistryValueError(e)
+#[cfg(windows)]
+impl From<windows_result::Error> for Error {
+    fn from(e: windows_result::Error) -> Self {
+        Error::RegistryError(e)
     }
 }
 

@@ -1,15 +1,20 @@
+#[cfg(windows)]
 use windows::core::PCWSTR;
 
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PCWSTR(pub *const u16);
+
 macro_rules! define_id {
-    ($name:ident, $value:tt) => (
+    ($name:ident, $value:tt) => {
         pub const $name: PCWSTR = PCWSTR($value as u16 as *const u16);
-    )
+    };
 }
 
 macro_rules! define_idc {
-    ($name:ident, $value:tt) => (
+    ($name:ident, $value:tt) => {
         pub const $name: i32 = $value;
-    )
+    };
 }
 
 // Dialogs

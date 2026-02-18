@@ -1,11 +1,11 @@
 #![windows_subsystem = "windows"]
 
+mod cli;
+mod gui;
 mod i18n;
 mod installer;
 mod resource;
 mod utils;
-mod cli;
-mod gui;
 
 pub use crate::i18n::_rust_i18n_translate;
 
@@ -18,11 +18,13 @@ fn main() -> Result<(), installer::Error> {
     i18n::init_locale();
 
     // Command line interface / Unattended mode
-    if cli::run()? { return Ok(()); }
+    if cli::run()? {
+        return Ok(());
+    }
 
     // GUI mode (no arguments)
     if let Err(e) = gui::run() {
-        e.code().unwrap();
+        eprintln!("GUI Error: {}", e);
     }
 
     Ok(())

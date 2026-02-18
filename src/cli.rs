@@ -1,15 +1,21 @@
 use std::path::{Path, PathBuf};
 
-use crate::i18n::{t};
+use crate::i18n::t;
+#[cfg(windows)]
 use windows::{
     core::{w, HSTRING},
     Win32::UI::{
         Shell::ShellExecuteW,
-        WindowsAndMessaging::{MessageBoxW, IDCANCEL, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_OKCANCEL, SW_NORMAL}
-    }
+        WindowsAndMessaging::{
+            MessageBoxW, IDCANCEL, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_OKCANCEL, SW_NORMAL,
+        },
+    },
 };
 
-use crate::{installer::{self, Installer, Target}, utils};
+use crate::{
+    installer::{self, Installer, Target},
+    utils,
+};
 
 #[derive(Default)]
 struct Args {
@@ -22,12 +28,13 @@ struct Args {
     launch_game: bool,
     game_args: Vec<String>,
     pre_install: bool,
-    post_install: bool
+    post_install: bool,
+    enable_dotlocal: bool,
 }
 
 enum Command {
     Install,
-    Uninstall
+    Uninstall,
 }
 
 #[inline]
@@ -57,22 +64,30 @@ impl Args {
                 "install" => args.command = Some(Command::Install),
                 "uninstall" => args.command = Some(Command::Uninstall),
 
-
                 "--install-dir" => args.install_dir = Some(require_next_arg(&mut iter).into()),
                 "--target" => args.target = Some(require_next_arg(&mut iter)),
                 "--explicit-target" => {
                     let dll_name = require_next_arg(&mut iter);
-                    args.explicit_target = Some(*Target::VALUES.iter()
-                        .filter(|t| t.dll_name() == dll_name)
-                        .next()
-                        .unwrap_or_else(|| std::process::exit(128))
+                    args.explicit_target = Some(
+                        *Target::VALUES
+                            .iter()
+                            .filter(|t| t.dll_name() == dll_name)
+                            .next()
+                            .unwrap_or_else(|| std::process::exit(128)),
                     );
-                },
-                "--sleep" => args.sleep = Some(require_next_arg(&mut iter).parse().unwrap_or_else(|_| std::process::exit(128))),
+                }
+                "--sleep" => {
+                    args.sleep = Some(
+                        require_next_arg(&mut iter)
+                            .parse()
+                            .unwrap_or_else(|_| std::process::exit(128)),
+                    )
+                }
                 "--prompt-for-game-exit" => args.prompt_for_game_exit = true,
                 "--launch-game" => args.launch_game = true,
                 "--pre-install" => args.pre_install = true,
                 "--post-install" => args.post_install = true,
+                "--enable-dotlocal" => args.enable_dotlocal = true,
                 "--" => in_game_args = true,
 
                 _ => {
@@ -88,7 +103,13 @@ impl Args {
 
 pub fn run() -> Result<bool, installer::Error> {
     let mut args = Args::parse();
-    
+
+    // Handle --enable-dotlocal (runs elevated)
+    if args.enable_dotlocal {
+        installer::enable_dotlocal();
+        return Ok(true);
+    }
+
     if let Some(command) = args.command {
         if let Some(sleep) = args.sleep {
             std::thread::sleep(std::time::Duration::from_millis(sleep));
@@ -96,17 +117,20 @@ pub fn run() -> Result<bool, installer::Error> {
 
         if args.prompt_for_game_exit {
             while utils::is_game_running() {
+                #[cfg(windows)]
                 unsafe {
                     let res = MessageBoxW(
                         None,
                         &HSTRING::from(t!("cli.game_running")),
                         &HSTRING::from(t!("cli.installer_title")),
-                        MB_ICONINFORMATION | MB_OKCANCEL
+                        MB_ICONINFORMATION | MB_OKCANCEL,
                     );
                     if res == IDCANCEL {
                         return Ok(true);
                     }
                 }
+                #[cfg(not(windows))]
+                break;
             }
         }
 
@@ -123,26 +147,30 @@ pub fn run() -> Result<bool, installer::Error> {
             }
         }
 
-        let explicit_target = args.explicit_target.or_else(|| {
-            let target_name = Path::new(args.target.as_ref()?).file_name()?;
-            let target_name_str = target_name.to_string_lossy().to_ascii_lowercase();
-            for t in Target::VALUES {
-                if t.dll_name().to_ascii_lowercase() == target_name_str {
-                    return Some(*t);
+        let explicit_target = args
+            .explicit_target
+            .or_else(|| {
+                let target_name = Path::new(args.target.as_ref()?).file_name()?;
+                let target_name_str = target_name.to_string_lossy().to_ascii_lowercase();
+                for t in Target::VALUES {
+                    if t.dll_name().to_ascii_lowercase() == target_name_str {
+                        return Some(*t);
+                    }
                 }
-            }
-            None
-        }).unwrap_or_else(|| {
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &HSTRING::from(t!("cli.failed_determine_target")),
-                    &HSTRING::from(t!("cli.installer_title")),
-                    MB_ICONERROR | MB_OK
-                );
-            }
-            std::process::exit(128);
-        });
+                None
+            })
+            .unwrap_or_else(|| {
+                #[cfg(windows)]
+                unsafe {
+                    MessageBoxW(
+                        None,
+                        &HSTRING::from(t!("cli.failed_determine_target")),
+                        &HSTRING::from(t!("cli.installer_title")),
+                        MB_ICONERROR | MB_OK,
+                    );
+                }
+                std::process::exit(128);
+            });
 
         let installer = Installer::custom(args.install_dir, explicit_target, args.target);
         let res = match command {
@@ -156,17 +184,26 @@ pub fn run() -> Result<bool, installer::Error> {
                     res = res.and_then(|_| installer.post_install());
                 }
                 res
-            },
-            Command::Uninstall => installer.uninstall()
+            }
+            Command::Uninstall => installer.uninstall(),
         };
         if let Err(e) = res {
-            unsafe { MessageBoxW(None, &HSTRING::from(e.to_string()), w!("Fridgerator Installer"), MB_ICONERROR | MB_OK); }
+            #[cfg(windows)]
+            unsafe {
+                MessageBoxW(
+                    None,
+                    &HSTRING::from(e.to_string()),
+                    w!("Fridgerator Installer"),
+                    MB_ICONERROR | MB_OK,
+                );
+            }
             return Err(e);
         }
 
         if args.launch_game {
             let game_dir = installer.install_dir.unwrap();
             let exe_path = game_dir.join("umamusume.exe");
+            #[cfg(windows)]
             unsafe {
                 ShellExecuteW(
                     None,
@@ -174,14 +211,13 @@ pub fn run() -> Result<bool, installer::Error> {
                     &HSTRING::from(exe_path.to_str().unwrap()),
                     &HSTRING::from(args.game_args.join(" ")),
                     &HSTRING::from(game_dir.to_str().unwrap()),
-                    SW_NORMAL
+                    SW_NORMAL,
                 );
             }
         }
 
         Ok(true)
-    }
-    else {
+    } else {
         Ok(false)
     }
 }
